@@ -66,6 +66,54 @@ def suppress_red_text(img_bgr: np.ndarray) -> np.ndarray:
     return red
 
 
+def locate_yellow_pad(
+    image_bgr: np.ndarray,
+    *,
+    margin_px: int = 6,
+    min_area_frac: float = 0.12,
+) -> Tuple[Optional[Tuple[int, int, int, int]], np.ndarray]:
+    """
+    Detect the primary yellow gluepad region using color segmentation.
+    Returns ((x0, y0, x1, y1), mask) or (None, mask) if not found.
+    """
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([18, 70, 80], dtype=np.uint8)
+    upper = np.array([40, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, mask
+
+    h, w = image_bgr.shape[:2]
+    min_area = float(max(1.0, min_area_frac * h * w))
+    best_rect = None
+    best_area = 0.0
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area or area <= best_area:
+            continue
+        x, y, width, height = cv2.boundingRect(contour)
+        best_rect = (x, y, x + width, y + height)
+        best_area = area
+
+    if best_rect is None:
+        return None, mask
+
+    margin = max(0, int(margin_px))
+    x0, y0, x1, y1 = best_rect
+    x0 = max(0, x0 - margin)
+    y0 = max(0, y0 - margin)
+    x1 = min(w, x1 + margin)
+    y1 = min(h, y1 + margin)
+    return (x0, y0, x1, y1), mask
+
+
 def auto_crop_noise_bands(peaks: np.ndarray, max_crop_frac: float = 0.35, mult: float = 2.2) -> Tuple[int, int]:
     """Crop dense horizontal noise bands. Returns (y_start, y_end) indices to keep."""
     H, W = peaks.shape[:2]
@@ -150,6 +198,9 @@ def detect_dark_blobs(
     bg_kernel: int = 41,
     peak_thresh: float = 0.36,
     min_support_area: int = 6,
+    min_blob_area: int = 1,
+    use_pad_crop: bool = True,
+    pad_crop_margin_px: int = 6,
     use_red_suppression: bool = True,
     use_title_line_crop: bool = True,
     title_line_margin_px: int = 12,
@@ -168,6 +219,8 @@ def detect_dark_blobs(
     Robust counter for yellow gluepads. Returns (count, annotated, debug).
     Applies white balance and CLAHE to stabilize illumination before detection.
     """
+    min_blob_area = max(1, int(min_blob_area))
+    min_support_area = max(0, int(min_support_area))
     orig_image = image
     processed_bgr, L_eq, balanced = normalize_illumination(
         image,
@@ -179,6 +232,14 @@ def detect_dark_blobs(
 
     H0, W0 = processed_bgr.shape[:2]
     y_pre_start = 0
+    pad_bounds: Optional[Tuple[int, int, int, int]] = None
+    pad_mask = np.zeros((H0, W0), dtype=np.uint8)
+    if use_pad_crop:
+        pad_bounds, pad_mask = locate_yellow_pad(
+            processed_bgr,
+            margin_px=int(pad_crop_margin_px),
+        )
+
     if use_title_line_crop:
         y_rule = find_title_rule_y(processed_bgr)
         if y_rule is not None:
@@ -203,12 +264,25 @@ def detect_dark_blobs(
     peaks = (peaks * 255).astype(np.uint8)
 
     H, W = peaks.shape[:2]
+    x_start, x_end = 0, W
     y_start, y_end = int(y_pre_start), H
-    if auto_crop and y_start < y_end:
-        cropped = peaks[y_start:y_end, :]
-        ys, ye = auto_crop_noise_bands(cropped, max_crop_frac=max_crop_frac, mult=crop_density_mult)
-        y_start += ys
-        y_end = y_start + (ye - ys)
+
+    if pad_bounds is not None:
+        px0, py0, px1, py1 = pad_bounds
+        x_start = max(x_start, int(px0))
+        x_end = min(x_end, int(px1))
+        y_start = max(y_start, int(py0))
+        y_end = min(y_end, int(py1))
+        if x_end - x_start < 5 or y_end - y_start < 5:
+            x_start, x_end = 0, W
+            y_start, y_end = int(y_pre_start), H
+
+    if auto_crop and y_start < y_end and x_start < x_end:
+        cropped = peaks[y_start:y_end, x_start:x_end]
+        if cropped.size > 0:
+            ys, ye = auto_crop_noise_bands(cropped, max_crop_frac=max_crop_frac, mult=crop_density_mult)
+            y_start += ys
+            y_end = y_start + (ye - ys)
 
     if crop_top_pct > 0:
         y_start = max(y_start, int(H * crop_top_pct))
@@ -217,9 +291,11 @@ def detect_dark_blobs(
 
     y_start = max(0, min(y_start, H))
     y_end = max(y_start + 1, min(y_end, H))
+    x_start = max(0, min(x_start, W - 1))
+    x_end = max(x_start + 1, min(x_end, W))
 
-    thr_c = thr[y_start:y_end, :]
-    peaks_c = peaks[y_start:y_end, :]
+    thr_c = thr[y_start:y_end, x_start:x_end]
+    peaks_c = peaks[y_start:y_end, x_start:x_end]
 
     peaks_binary = (peaks_c > 0).astype(np.uint8)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(peaks_binary, connectivity=8)
@@ -233,7 +309,11 @@ def detect_dark_blobs(
 
     height_c, width_c = thr_c.shape[:2]
     for label in range(1, num_labels):
-        x, y, w, h, _ = stats[label]
+        x, y, w, h, comp_area = stats[label]
+        comp_area = int(comp_area)
+        if comp_area < min_blob_area:
+            continue
+
         x0 = max(int(x) - pad, 0)
         y0 = max(int(y) - pad, 0)
         x1 = min(int(x + w + pad), width_c)
@@ -247,7 +327,7 @@ def detect_dark_blobs(
 
         if annotate and annotated is not None:
             cx, cy = centroids[label]
-            cx_i = int(round(cx))
+            cx_i = int(round(cx)) + x_start
             cy_i = int(round(cy)) + y_start
             if 0 <= cx_i < W0 and 0 <= cy_i < H0:
                 cv2.circle(annotated, (cx_i, cy_i), 8, (0, 0, 255), 1)
@@ -274,6 +354,10 @@ def detect_dark_blobs(
         "pre_rule_y": int(y_pre_start),
         "y_start": int(y_start),
         "y_end": int(y_end),
+        "x_start": int(x_start),
+        "x_end": int(x_end),
+        "min_blob_area": int(min_blob_area),
+        "pad_mask": pad_mask,
     }
     return count, annotated, debug
 
